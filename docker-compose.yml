@@ -1,0 +1,29 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: runner-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: runner-worker
+    command: ["python", "worker.py"]
+    env_file: .env
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    # container_name を付けると既存と衝突しやすいので省略
+    ports:
+      - "6379:6379"
+
+
