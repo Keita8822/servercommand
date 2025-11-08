@@ -10,12 +10,12 @@ from pydantic import BaseModel, Field
 
 # =========================================================
 # FastAPI アプリ本体
+# 重要: root_path="/commandtest" を指定
 # =========================================================
 
 app = FastAPI(
     title="サーバーコマンド実行システム",
-    docs_url="/commandtest/docs",          # Swagger UI のパス
-    openapi_url="/commandtest/openapi.json",  # OpenAPI(JSON) のパス
+    root_path="/commandtest",  # ← ここが今回のポイント
 )
 
 # ストーリー用の作業ディレクトリ
@@ -131,9 +131,6 @@ def command_run(
 
 # =========================================================
 # 2) ストーリー用 API
-#    /story/start でワークスペース初期化
-#    /story/step   でその中でコマンドを実行
-#    /story/reset  で完全リセット
 # =========================================================
 
 class StoryStartResponse(BaseModel):
@@ -240,6 +237,6 @@ def story_reset():
 # シンプルなヘルスチェック
 # =========================================================
 
-@app.get("/commandtest/health", tags=["その他"], summary="疎通確認用ヘルスチェック")
+@app.get("/health", tags=["その他"], summary="疎通確認用ヘルスチェック")
 def health_check():
     return {"status": "ok"}
