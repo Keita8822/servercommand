@@ -5,17 +5,19 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, Query, Response
 from pydantic import BaseModel, Field
 
 # =========================================================
 # FastAPI アプリ本体
-# 重要: root_path="/commandtest" を指定
+# 重要: docs_url / openapi_url を /commandtest 配下にする
 # =========================================================
 
 app = FastAPI(
     title="サーバーコマンド実行システム",
-    root_path="/commandtest",  # ← ここが今回のポイント
+    docs_url="/commandtest/docs",
+    openapi_url="/commandtest/openapi.json",
+    redoc_url=None,
 )
 
 # ストーリー用の作業ディレクトリ
@@ -23,10 +25,7 @@ STORY_ROOT = Path("/tmp/command_story")
 
 
 def get_story_workspace() -> Path:
-    """
-    ストーリー用の作業ディレクトリを返す。
-    なければ作成する。
-    """
+    """ストーリー用の作業ディレクトリを返す。なければ作成する。"""
     STORY_ROOT.mkdir(parents=True, exist_ok=True)
     return STORY_ROOT
 
@@ -118,7 +117,7 @@ def command_run(
         return Response(
             content=body_text,
             media_type="text/plain; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="result.txt"'},
+            headers={"Content-Disposition": 'attachment; filename=\"result.txt\"'},
         )
 
     # 画面プレビュー
@@ -224,9 +223,7 @@ def story_step(req: CommandRequest):
     tags=["ストーリー"],
 )
 def story_reset():
-    """
-    ストーリー用ディレクトリを完全に消して作り直す。
-    """
+    """ストーリー用ディレクトリを完全に消して作り直す。"""
     if STORY_ROOT.exists():
         shutil.rmtree(STORY_ROOT)
     workspace = get_story_workspace()
@@ -240,3 +237,4 @@ def story_reset():
 @app.get("/health", tags=["その他"], summary="疎通確認用ヘルスチェック")
 def health_check():
     return {"status": "ok"}
+
