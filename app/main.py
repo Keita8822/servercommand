@@ -10,13 +10,12 @@ from pydantic import BaseModel, Field
 
 # =========================================================
 # FastAPI アプリ本体
-# 重要: docs_url / openapi_url を /commandtest 配下にする
 # =========================================================
 
 app = FastAPI(
     title="サーバーコマンド実行システム",
-    docs_url="/commandtest/docs",
-    openapi_url="/commandtest/openapi.json",
+    docs_url="/commandtest/docs",           # Swagger UI の URL
+    openapi_url="/commandtest/openapi.json", # OpenAPI JSON の URL
     redoc_url=None,
 )
 
@@ -31,105 +30,58 @@ def get_story_workspace() -> Path:
 
 
 # =========================================================
-# 共通：コマンド実行の処理
+# コマンド実行の共通処理
 # =========================================================
 
 class CommandRequest(BaseModel):
-    command: str = Field(..., description="サーバで実行するコマンド（例: echo hello）")
-    timeout_sec: int = Field(
-        5,
-        ge=1,
-        le=60,
-        description="タイムアウト秒（1〜60、未指定は 5 秒）",
-    )
+    command: str = Field(..., description="実行するコマンド（例: echo hello）")
+    timeout_sec: int = Field(5, ge=1, le=60, description="タイムアウト秒（1〜60）")
 
 
-def run_shell_command(
-    cmd: str,
-    timeout_sec: int,
-    cwd: Path | None = None,
-) -> tuple[int | None, str, str]:
-    """
-    シェルコマンドを実行するヘルパー関数。
-    return_code, stdout, stderr を返す。
-    タイムアウト時は return_code=None にする。
-    """
+def run_shell_command(cmd: str, timeout_sec: int, cwd: Path | None = None):
+    """コマンド実行"""
     try:
-        r = subprocess.run(
-            cmd,
-            shell=True,
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
+        result = subprocess.run(
+            cmd, shell=True, text=True,
+            capture_output=True, timeout=timeout_sec,
             cwd=str(cwd) if cwd else None,
         )
-        return r.returncode, r.stdout, r.stderr
+        return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return None, "", f"TIMEOUT (> {timeout_sec} sec)"
-    except Exception as e:  # 予期しない例外
+        return None, "", f"TIMEOUT (> {timeout_sec}s)"
+    except Exception as e:
         return None, "", f"ERROR: {e!r}"
 
 
 # =========================================================
-# 1) 通常のコマンド実行 API
+# 通常コマンド実行 API
 # =========================================================
 
 class CommandResult(BaseModel):
-    return_code: int | None = Field(None, description="終了コード（タイムアウト時は null）")
-    stdout: str = Field("", description="標準出力")
-    stderr: str = Field("", description="標準エラー出力")
+    return_code: int | None
+    stdout: str
+    stderr: str
 
 
-@app.post(
-    "/command/run",
-    response_model=CommandResult,
-    summary="コマンド実行（通常）",
-    tags=["コマンド"],
-)
-def command_run(
-    req: CommandRequest,
-    mode: Literal["json", "preview", "download"] = Query(
-        "json",
-        description="結果の返し方: json / preview / download",
-    ),
-):
-    """
-    単発でコマンドを実行するエンドポイント。
+@app.post("/command/run", response_model=CommandResult, tags=["コマンド"])
+def run_command(req: CommandRequest, mode: Literal["json", "preview", "download"] = "json"):
+    """任意のコマンドを実行"""
+    code, out, err = run_shell_command(req.command, req.timeout_sec)
+    text = f"終了コード: {code}\n標準出力:\n{out}\n標準エラー:\n{err}"
 
-    - `mode=json`     … JSON で結果を返す（標準的な使い方）
-    - `mode=preview`  … テキストとして画面にそのまま表示
-    - `mode=download` … result.txt としてダウンロード
-    """
-    return_code, stdout, stderr = run_shell_command(
-        req.command,
-        timeout_sec=req.timeout_sec,
-        cwd=None,
-    )
-
-    body_text = (
-        f"終了コード: {return_code}\n"
-        f"標準出力:\n{stdout}\n"
-        f"標準エラー:\n{stderr}"
-    )
-
-    # ダウンロード
-    if mode == "download":
-        return Response(
-            content=body_text,
-            media_type="text/plain; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename=\"result.txt\"'},
-        )
-
-    # 画面プレビュー
     if mode == "preview":
-        return Response(content=body_text, media_type="text/plain; charset=utf-8")
-
-    # JSON（通常）
-    return CommandResult(return_code=return_code, stdout=stdout, stderr=stderr)
+        return Response(content=text, media_type="text/plain; charset=utf-8")
+    elif mode == "download":
+        return Response(
+            content=text, media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=result.txt"},
+        )
+    else:
+        return CommandResult(return_code=code, stdout=out, stderr=err)
 
 
 # =========================================================
-# 2) ストーリー用 API
+# ストーリー性コマンド実行 API
 # =========================================================
 
 class StoryStartResponse(BaseModel):
@@ -138,39 +90,22 @@ class StoryStartResponse(BaseModel):
     first_hint: str
 
 
-@app.post(
-    "/story/start",
-    response_model=StoryStartResponse,
-    summary="ストーリー開始（ワークスペース作成）",
-    tags=["ストーリー"],
-)
+@app.post("/story/start", response_model=StoryStartResponse, tags=["ストーリー"])
 def story_start():
-    """
-    ストーリー用の作業ディレクトリを作り直して初期化する。
-    例として /tmp/command_story を利用。
-    """
-    # 既存を消して作り直し
+    """ストーリー用ワークスペースを初期化"""
     if STORY_ROOT.exists():
         shutil.rmtree(STORY_ROOT)
-    workspace = get_story_workspace()
-
-    # 説明用の README を作っておく（なくても動作には影響なし）
-    readme = workspace / "README.txt"
+    ws = get_story_workspace()
+    readme = ws / "README.txt"
     readme.write_text(
-        "ここはストーリー用の作業ディレクトリです。\n"
-        "例: 以下の順番でコマンドを打ってみてください。\n"
-        "  1) pwd\n"
-        "  2) mkdir test\n"
-        "  3) cd test && touch test.txt\n"
-        "  4) cd test && ls -l\n"
-        "  5) cd .. && rm -r test\n",
+        "ここはストーリー用ワークスペースです。\n"
+        "例: mkdir test → cd test → touch file.txt → ls -l\n",
         encoding="utf-8",
     )
-
     return StoryStartResponse(
-        message="ストーリー用ワークスペースを初期化しました。",
-        workspace=str(workspace),
-        first_hint="最初は `pwd` や `ls` で中身を確認してみてください。",
+        message="ストーリー開始。/tmp/command_story が作成されました。",
+        workspace=str(ws),
+        first_hint="`pwd` または `ls` で確認してみましょう。",
     )
 
 
@@ -181,60 +116,32 @@ class StoryStepResult(BaseModel):
     next_hint: str | None = None
 
 
-@app.post(
-    "/story/step",
-    response_model=StoryStepResult,
-    summary="ストーリー用コマンド実行（ワークスペース内）",
-    tags=["ストーリー"],
-)
+@app.post("/story/step", response_model=StoryStepResult, tags=["ストーリー"])
 def story_step(req: CommandRequest):
-    """
-    ストーリー用ワークスペースをカレントディレクトリにしてコマンド実行。
-    `command_run` との違いは cwd が固定されること。
-    """
-    workspace = get_story_workspace()
+    """ストーリー用コマンド実行"""
+    ws = get_story_workspace()
+    code, out, err = run_shell_command(req.command, req.timeout_sec, cwd=ws)
 
-    return_code, stdout, stderr = run_shell_command(
-        req.command,
-        timeout_sec=req.timeout_sec,
-        cwd=workspace,
-    )
-
-    # ざっくりした次のヒント（本格的な判定はしていない）
     hint = None
-    if "mkdir" in req.command and "test" in req.command:
-        hint = "作った test ディレクトリの中にファイルを作ってみましょう。例: cd test && touch test.txt"
-    elif "touch" in req.command and "test.txt" in req.command:
-        hint = "ファイルができたか `cd test && ls -l` で確認してみましょう。"
-    elif "rm" in req.command and "test" in req.command:
-        hint = "`ls` でディレクトリが消えているか確認してみましょう。"
+    if "mkdir" in req.command:
+        hint = "test フォルダを作ったら cd test して中を見てみましょう。"
+    elif "touch" in req.command:
+        hint = "ファイルができたか ls -l で確認。"
+    elif "rm" in req.command:
+        hint = "削除したら ls で確認してみましょう。"
 
-    return StoryStepResult(
-        return_code=return_code,
-        stdout=stdout,
-        stderr=stderr,
-        next_hint=hint,
-    )
+    return StoryStepResult(return_code=code, stdout=out, stderr=err, next_hint=hint)
 
 
-@app.post(
-    "/story/reset",
-    summary="ストーリー用ワークスペースのリセット",
-    tags=["ストーリー"],
-)
+@app.post("/story/reset", tags=["ストーリー"])
 def story_reset():
-    """ストーリー用ディレクトリを完全に消して作り直す。"""
+    """ストーリー用フォルダを再作成"""
     if STORY_ROOT.exists():
         shutil.rmtree(STORY_ROOT)
-    workspace = get_story_workspace()
-    return {"message": "ストーリー用ワークスペースをリセットしました。", "workspace": str(workspace)}
+    ws = get_story_workspace()
+    return {"message": "リセット完了", "workspace": str(ws)}
 
 
-# =========================================================
-# シンプルなヘルスチェック
-# =========================================================
-
-@app.get("/health", tags=["その他"], summary="疎通確認用ヘルスチェック")
-def health_check():
+@app.get("/health")
+def health():
     return {"status": "ok"}
-
