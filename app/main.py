@@ -1,228 +1,245 @@
+from __future__ import annotations
 
-from typing import Literal
-from fastapi import FastAPI, Response, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+import shutil
 import subprocess
+from pathlib import Path
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException, Query, Response
+from pydantic import BaseModel, Field
+
+# =========================================================
+# FastAPI アプリ本体
+# =========================================================
 
 app = FastAPI(
-    title="サーバコマンドシステム",
-    description="コマンドを安全な範囲で実行し、結果をJSON/プレビュー/ダウンロードで返します。",
-    version="1.0.0",
+    title="サーバーコマンド実行システム",
+    docs_url="/commandtest/docs",          # Swagger UI のパス
+    openapi_url="/commandtest/openapi.json",  # OpenAPI(JSON) のパス
 )
 
+# ストーリー用の作業ディレクトリ
+STORY_ROOT = Path("/tmp/command_story")
+
+
+def get_story_workspace() -> Path:
+    """
+    ストーリー用の作業ディレクトリを返す。
+    なければ作成する。
+    """
+    STORY_ROOT.mkdir(parents=True, exist_ok=True)
+    return STORY_ROOT
+
+
+# =========================================================
+# 共通：コマンド実行の処理
+# =========================================================
+
 class CommandRequest(BaseModel):
-    コマンド: str = Field(
-        ...,
-        title="実行するコマンド",
-        description="例: `echo Hello` / `pwd` / `ls -l` など",
-        examples=["echo Hello", "pwd", "ls -l"],
-    )
-    タイムアウト秒: int = Field(
+    command: str = Field(..., description="サーバで実行するコマンド（例: echo hello）")
+    timeout_sec: int = Field(
         5,
         ge=1,
         le=60,
-        title="タイムアウト（秒）",
-        description="コマンドがこの秒数を超えて応答しない場合は中断します（1〜60）。",
-        examples=[5, 10, 30],
+        description="タイムアウト秒（1〜60、未指定は 5 秒）",
     )
 
-@app.post(
-    "/実行",
-    summary="コマンドを実行する",
-    description="入力したシェルコマンドを実行し、結果を返します。既定はJSON。`形式`を `preview` または `download` にするとテキストとして返却/ダウンロードされます。",
-)
-def 実行(
-    req: CommandRequest,
-    形式: Literal["json", "preview", "download"] = Query(
-        "json",
-        description="結果の返却形式: `json`（既定）/ `preview`（テキスト表示）/ `download`（テキストダウンロード）",
-        examples=["json", "preview", "download"],
-    ),
-):
+
+def run_shell_command(
+    cmd: str,
+    timeout_sec: int,
+    cwd: Path | None = None,
+) -> tuple[int | None, str, str]:
+    """
+    シェルコマンドを実行するヘルパー関数。
+    return_code, stdout, stderr を返す。
+    タイムアウト時は return_code=None にする。
+    """
     try:
         r = subprocess.run(
-            req.コマンド,
+            cmd,
             shell=True,
-            capture_output=True,
             text=True,
-            timeout=req.タイムアウト秒,
+            capture_output=True,
+            timeout=timeout_sec,
+            cwd=str(cwd) if cwd else None,
         )
+        return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
-        body = f"{req.タイムアウト秒}秒を超えてタイムアウトしました。"
-        if 形式 == "download":
-            return Response(
-                content=body,
-                media_type="text/plain; charset=utf-8",
-                headers={"Content-Disposition": 'attachment; filename="timeout.txt"'},
-            )
-        if 形式 == "preview":
-            return Response(content=body, media_type="text/plain; charset=utf-8")
-        return JSONResponse({"終了コード": -1, "標準出力": "", "標準エラー": body})
+        return None, "", f"TIMEOUT (> {timeout_sec} sec)"
+    except Exception as e:  # 予期しない例外
+        return None, "", f"ERROR: {e!r}"
 
 
-    body = (
-        f"終了コード: {r.returncode}\n"
-        f"標準出力:\n{r.stdout}\n"
-        f"標準エラー:\n{r.stderr}"
+# =========================================================
+# 1) 通常のコマンド実行 API
+# =========================================================
+
+class CommandResult(BaseModel):
+    return_code: int | None = Field(None, description="終了コード（タイムアウト時は null）")
+    stdout: str = Field("", description="標準出力")
+    stderr: str = Field("", description="標準エラー出力")
+
+
+@app.post(
+    "/command/run",
+    response_model=CommandResult,
+    summary="コマンド実行（通常）",
+    tags=["コマンド"],
+)
+def command_run(
+    req: CommandRequest,
+    mode: Literal["json", "preview", "download"] = Query(
+        "json",
+        description="結果の返し方: json / preview / download",
+    ),
+):
+    """
+    単発でコマンドを実行するエンドポイント。
+
+    - `mode=json`     … JSON で結果を返す（標準的な使い方）
+    - `mode=preview`  … テキストとして画面にそのまま表示
+    - `mode=download` … result.txt としてダウンロード
+    """
+    return_code, stdout, stderr = run_shell_command(
+        req.command,
+        timeout_sec=req.timeout_sec,
+        cwd=None,
     )
 
-    if 形式 == "download":
+    body_text = (
+        f"終了コード: {return_code}\n"
+        f"標準出力:\n{stdout}\n"
+        f"標準エラー:\n{stderr}"
+    )
+
+    # ダウンロード
+    if mode == "download":
         return Response(
-            content=body,
+            content=body_text,
             media_type="text/plain; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="result.txt"'},
         )
-    if 形式 == "preview":
-        return Response(content=body, media_type="text/plain; charset=utf-8")
+
+    # 画面プレビュー
+    if mode == "preview":
+        return Response(content=body_text, media_type="text/plain; charset=utf-8")
+
+    # JSON（通常）
+    return CommandResult(return_code=return_code, stdout=stdout, stderr=stderr)
 
 
-    return JSONResponse({"終了コード": r.returncode, "標準出力": r.stdout, "標準エラー": r.stderr})
+# =========================================================
+# 2) ストーリー用 API
+#    /story/start でワークスペース初期化
+#    /story/step   でその中でコマンドを実行
+#    /story/reset  で完全リセット
+# =========================================================
+
+class StoryStartResponse(BaseModel):
+    message: str
+    workspace: str
+    first_hint: str
 
 
-# 日本語UI
-@app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
-def ui():
-    return HTMLResponse("""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>日本語コマンド実行UI</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:880px;margin:24px auto;padding:0 16px}
-  h1{font-size:20px;margin:0 0 16px}
-  .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:16px}
-  label{display:block;font-weight:600;margin:8px 0 6px}
-  textarea,input[type=number]{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;padding:10px;font-family:ui-monospace,Consolas,monospace}
-  textarea{min-height:110px}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .row .col{flex:1 1 220px}
-  .hint{color:#666;font-size:12px;margin-top:4px}
-  .presets{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
-  .preset{border:1px solid #aaa;background:#fafafa;border-radius:999px;padding:6px 10px;cursor:pointer}
-  .actions{display:flex;gap:8px;margin-top:12px}
-  button{padding:10px 14px;border:0;border-radius:8px;cursor:pointer}
-  .primary{background:#2563eb;color:#fff}
-  .ghost{background:#f3f4f6}
-  .result{white-space:pre-wrap;background:#0b1020;color:#e2e8f0;border-radius:12px;padding:12px;min-height:120px;overflow:auto}
-  .seg{display:flex;gap:8px;margin-top:6px}
-  .seg label{font-weight:500}
-</style>
-</head>
-<body>
-  <h1>サーバコマンドシステム</h1>
+@app.post(
+    "/story/start",
+    response_model=StoryStartResponse,
+    summary="ストーリー開始（ワークスペース作成）",
+    tags=["ストーリー"],
+)
+def story_start():
+    """
+    ストーリー用の作業ディレクトリを作り直して初期化する。
+    例として /tmp/command_story を利用。
+    """
+    # 既存を消して作り直し
+    if STORY_ROOT.exists():
+        shutil.rmtree(STORY_ROOT)
+    workspace = get_story_workspace()
 
-  <div class="card">
-    <label for="cmd">コマンド <span class="hint">（例：<code>echo こんにちは</code> / <code>pwd</code> / <code>ls -l</code>）</span></label>
-    <textarea id="cmd" placeholder="例：echo こんにちは"></textarea>
-    <div class="presets" id="presets"></div>
+    # 説明用の README を作っておく（なくても動作には影響なし）
+    readme = workspace / "README.txt"
+    readme.write_text(
+        "ここはストーリー用の作業ディレクトリです。\n"
+        "例: 以下の順番でコマンドを打ってみてください。\n"
+        "  1) pwd\n"
+        "  2) mkdir test\n"
+        "  3) cd test && touch test.txt\n"
+        "  4) cd test && ls -l\n"
+        "  5) cd .. && rm -r test\n",
+        encoding="utf-8",
+    )
 
-    <div class="row">
-      <div class="col">
-        <label for="timeout">タイムアウト（秒）</label>
-        <input id="timeout" type="number" min="1" max="60" value="5" />
-        <div class="hint">指定秒数を超えた場合は中断します（1〜60）。</div>
-      </div>
-      <div class="col">
-        <label>返却形式</label>
-        <div class="seg">
-          <label><input type="radio" name="fmt" value="json" checked> JSON</label>
-          <label><input type="radio" name="fmt" value="preview"> プレビュー（テキスト）</label>
-          <label><input type="radio" name="fmt" value="download"> ダウンロード（txt）</label>
-        </div>
-      </div>
-    </div>
+    return StoryStartResponse(
+        message="ストーリー用ワークスペースを初期化しました。",
+        workspace=str(workspace),
+        first_hint="最初は `pwd` や `ls` で中身を確認してみてください。",
+    )
 
-    <div class="actions">
-      <button class="primary" id="runBtn">実行する</button>
-      <button class="ghost" id="clearBtn">クリア</button>
-    </div>
-  </div>
 
-  <div class="card">
-    <label>結果</label>
-    <div id="result" class="result" aria-live="polite"></div>
-  </div>
+class StoryStepResult(BaseModel):
+    return_code: int | None
+    stdout: str
+    stderr: str
+    next_hint: str | None = None
 
-<script>
-  // プリセット（必要に応じて増減OK）
-  const PRESETS = [
-    {label: "現在の場所を表示 (pwd)", cmd: "pwd"},
-    {label: "ファイル一覧 (ls -l)", cmd: "ls -l"},
-    {label: "テキスト出力 (echo)", cmd: "echo こんにちは"},
-    {label: "OS情報 (uname -a)", cmd: "uname -a"},
-    {label: "環境変数確認 (printenv | head)", cmd: "printenv | head"}
-  ];
 
-  const presetsWrap = document.getElementById("presets");
-  PRESETS.forEach(p => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "preset";
-    b.textContent = p.label;
-    b.addEventListener("click", () => {
-      document.getElementById("cmd").value = p.cmd;
-    });
-    presetsWrap.appendChild(b);
-  });
+@app.post(
+    "/story/step",
+    response_model=StoryStepResult,
+    summary="ストーリー用コマンド実行（ワークスペース内）",
+    tags=["ストーリー"],
+)
+def story_step(req: CommandRequest):
+    """
+    ストーリー用ワークスペースをカレントディレクトリにしてコマンド実行。
+    `command_run` との違いは cwd が固定されること。
+    """
+    workspace = get_story_workspace()
 
-  const runBtn = document.getElementById("runBtn");
-  const clearBtn = document.getElementById("clearBtn");
-  const result = document.getElementById("result");
+    return_code, stdout, stderr = run_shell_command(
+        req.command,
+        timeout_sec=req.timeout_sec,
+        cwd=workspace,
+    )
 
-  clearBtn.addEventListener("click", () => {
-    document.getElementById("cmd").value = "";
-    result.textContent = "";
-  });
+    # ざっくりした次のヒント（本格的な判定はしていない）
+    hint = None
+    if "mkdir" in req.command and "test" in req.command:
+        hint = "作った test ディレクトリの中にファイルを作ってみましょう。例: cd test && touch test.txt"
+    elif "touch" in req.command and "test.txt" in req.command:
+        hint = "ファイルができたか `cd test && ls -l` で確認してみましょう。"
+    elif "rm" in req.command and "test" in req.command:
+        hint = "`ls` でディレクトリが消えているか確認してみましょう。"
 
-  runBtn.addEventListener("click", async () => {
-    const cmd = document.getElementById("cmd").value.trim();
-    const timeout = Number(document.getElementById("timeout").value || 5);
-    const fmt = [...document.querySelectorAll('input[name="fmt"]')].find(x => x.checked)?.value || "json";
-    result.textContent = "実行中…";
+    return StoryStepResult(
+        return_code=return_code,
+        stdout=stdout,
+        stderr=stderr,
+        next_hint=hint,
+    )
 
-    if (!cmd) {
-      result.textContent = "コマンドが空です。入力してください。";
-      return;
-    }
 
-    try {
-      const url = `/実行?形式=${encodeURIComponent(fmt)}`;
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ "コマンド": cmd, "タイムアウト秒": timeout })
-      });
+@app.post(
+    "/story/reset",
+    summary="ストーリー用ワークスペースのリセット",
+    tags=["ストーリー"],
+)
+def story_reset():
+    """
+    ストーリー用ディレクトリを完全に消して作り直す。
+    """
+    if STORY_ROOT.exists():
+        shutil.rmtree(STORY_ROOT)
+    workspace = get_story_workspace()
+    return {"message": "ストーリー用ワークスペースをリセットしました。", "workspace": str(workspace)}
 
-      if (fmt === "download") {
-        // サーバが text/plain を返すのでダウンロード扱いにする
-        const blob = await resp.blob();
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = "result.txt";
-        a.click();
-        URL.revokeObjectURL(a.href);
-        result.textContent = "ダウンロードを開始しました。";
-        return;
-      }
 
-      // json / preview
-      const ctype = resp.headers.get("content-type") || "";
-      if (ctype.includes("application/json")) {
-        const data = await resp.json();
-        result.textContent = JSON.stringify(data, null, 2);
-      } else {
-        const text = await resp.text();
-        result.textContent = text;
-      }
-    } catch (e) {
-      result.textContent = "実行中にエラーが発生しました: " + String(e);
-    }
-  });
-</script>
-</body>
-</html>
-    """)
+# =========================================================
+# シンプルなヘルスチェック
+# =========================================================
 
+@app.get("/commandtest/health", tags=["その他"], summary="疎通確認用ヘルスチェック")
+def health_check():
+    return {"status": "ok"}
